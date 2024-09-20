@@ -1,0 +1,159 @@
+service: stepfunctions
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-1
+  iamRoleStatements:
+   - Effect: Allow
+     Action: dynamodb:*
+     Resource: arn:aws:dynamodb:us-east-1:058264198774:table/bookTable
+   - Effect: Allow
+     Action: dynamodb:*
+     Resource: arn:aws:dynamodb:us-east-1:058264198774:table/userTable
+   - Effect: Allow
+     Action: sns:*
+     Resource: arn:aws:sns:us-east-1:058264198774:NotifyCourier
+   - Effect: Allow
+     Action: sqs:*
+     Resource: arn:aws:sqs:us-east-1:058264198774:OrdersQueue
+   - Effect: Allow
+     Action: states:*
+     Resource: arn:aws:states:us-east-1:058264198774:stateMachine:storeCheckoutFlow
+
+plugins:
+  - serverless-step-functions 
+functions:
+  checkInventory:
+    handler: handler.checkInventory
+  calculateTotal:
+    handler: handler.calculateTotal
+  redeemPoints:
+    handler: handler.redeemPoints
+  billCustomer:
+    handler: handler.billCustomer
+  restoreRedeemPoints:
+    handler: handler.restoreRedeemPoints
+  restoreQuantity:
+    handler: handler.restoreQuantity
+  sqsWorker:
+    handler: handler.sqsWorker
+    events:
+      - sqs:
+          arn: arn:aws:sqs:us-east-1:058264198774:OrdersQueue
+          batchSize: 1
+
+stepFunctions:
+  stateMachines:
+    storeCheckoutFlow:
+     name: storeCheckoutFlow
+     definition:
+        Comment: "An order-processing flow example of the Amazon States Language using an AWS Lambda Function"
+        StartAt: checkInventory
+        States:
+          checkInventory:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [checkInventory, Arn]
+            Catch:
+              - ErrorEquals: [BookNotFound]
+                Next: BookNotFoundError
+              - ErrorEquals: [BookOutOfStock]
+                Next: BookOutOfStockError
+            ResultPath: "$.book"
+            Next: calculateTotal
+          calculateTotal:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [calculateTotal, Arn]
+            ResultPath: "$.total"
+            Next: isRedeemNeeded
+          isRedeemNeeded:
+            Type: Choice
+            Choices:
+             - Variable: $.redeem
+               BooleanEquals: true
+               Next: redeemPoints
+            Default: BillCustomer
+          redeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [redeemPoints, Arn]
+            ResultPath: "$.total"
+            Catch: 
+              - ErrorEquals: [States.ALL]
+                Next: RedeemPointsError
+            Next: BillCustomer
+          BillCustomer:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [billCustomer, Arn]
+            ResultPath: "$.billingStatus"
+            Retry:
+              - ErrorEquals: [States.ALL]
+                MaxAttempts: 3
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: "$.customerBilling"
+                Next: BillingError
+            Next: PrepareOrder
+          PrepareOrder: #Add to the queue, lambda worker, will allocate the quirier by calling a 3rd party api and reduce the amount from the item
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage.waitForTaskToken
+            Parameters:
+              QueueUrl: https://sqs.us-east-1.amazonaws.com/058264198774/OrdersQueue
+              MessageBody:       # body of the message sent to SQS
+                Input.$: "$"
+                Token.$: "$$.Task.Token" #From the context
+            ResultPath: "$.courierStatus"
+            Catch:
+              - ErrorEquals: [NoCourierAvailable]
+                ResultPath: "$.courierError"
+                Next: RefundCustomer
+            Next: DispatchOrder
+          DispatchOrder:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: arn:aws:sns:us-east-1:058264198774:NotifyCourier
+              Message.$: "$"    # body of message sent to the SNS topic
+            Next: Dispatched
+          Dispatched:
+            Type: Pass
+            Result: "Your order will be dispatched in 24 hours"
+            End: true
+          RefundCustomer:
+            Type: Pass
+            Result: "Customer is refunded"
+            ResultPath: "$.refundStatus"
+            Next: RestoreQuantity
+          RestoreQuantity:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreQuantity, Arn]
+            ResultPath: "$.quantityRestoreStatus"
+            Next: RestoreRedeemPoints
+          RedeemPointsError:
+            Type: Pass
+            Result: "Error in redeeming points"
+            End: true
+          BillingError:
+            Type: Pass
+            Result: "Billing error"
+            ResultPath: "$.billingStatus"
+            Next: RestoreRedeemPoints
+          RestoreRedeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreRedeemPoints, Arn]
+            End: true
+          BookNotFoundError:
+            Type: Pass
+            Result: "No such book available"
+            End: true
+          BookOutOfStockError:
+            Type: Pass
+            Result: "Sorry, the books is out of stock"
+            End: true
